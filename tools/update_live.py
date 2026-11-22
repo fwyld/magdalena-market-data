@@ -292,10 +292,16 @@ def c_cepea(page, key, header_has):
         return {"pts": pts, "extra": {"licencia": "CEPEA (CC BY-NC 4.0): uso no comercial con atribucion; confirmar con Legal el uso corporativo", "pagina": url}}
     return run
 
-def c_sofr_avg():
+_SOFRAI = {}
+def c_sofr_avg(dias, term):
+    """Promedios compuestos de SOFR de la NY Fed (30/90/180 dias, hacia atras). Una sola descarga por corrida para todas las series."""
     def run():
-        j = jget("https://markets.newyorkfed.org/api/rates/secured/sofrai/last/500.json", sid="nyfed_sofrai")["refRates"]
-        return {"pts": [(r["effectiveDate"], float(r["average90day"])) for r in j if r.get("average90day") is not None], "extra": {"nota": "promedio compuesto hacia atras de SOFR a 90 dias; NO es CME Term SOFR 3M (prospectivo)"}}
+        if "rows" not in _SOFRAI:
+            _SOFRAI["rows"] = jget("https://markets.newyorkfed.org/api/rates/secured/sofrai/last/500.json", sid="nyfed_sofrai")["refRates"]
+        rows, campo = _SOFRAI["rows"], "average%dday" % dias
+        assert all(r["type"] == "SOFRAI" for r in rows), "tipo de tasa inesperado"
+        return {"pts": [(r["effectiveDate"], float(r[campo])) for r in rows if r.get(campo) is not None],
+                "extra": {"nota": "promedio compuesto hacia atras de SOFR a %d dias; NO es CME Term SOFR %s (prospectivo)" % (dias, term)}}
     return run
 
 # ---------- CZ App (Czarnikow): cierres ICE No. 11 y No. 5 ----------
@@ -364,6 +370,7 @@ def czapp_refresh(srcs, res):
 # Nunca incluye: analisis interno de Magdalena, datos FMP (planes personales), cierres ICE de CZ App (sin permiso confirmado). Cepea (CC BY-NC) se publica con atribucion y se puede retirar con ALLOW_NC=0.
 PUBLISH = {
  "sofr_on": ("NY Fed", "Datos publicos del Federal Reserve Bank of New York (fuente: NY Fed Markets Data)"), "effr": ("NY Fed", "Datos publicos del NY Fed"), "sofr_avg90": ("NY Fed", "Datos publicos del NY Fed"),
+ "sofr_avg180": ("NY Fed", "Datos publicos del NY Fed"),
  "brl_bcb": ("BCB", "Banco Central do Brasil, datos abiertos (PTAX)"), "gtq_banguat": ("Banguat", "Banco de Guatemala, tipo de cambio de referencia (informacion publica)"),
  "brent_eia": ("EIA", "U.S. Energy Information Administration (dominio publico; citar la fuente)"), "wti_eia": ("EIA", "U.S. Energy Information Administration (dominio publico; citar la fuente)"),
  "inr_ecb": ("BCE", "Banco Central Europeo, tipos de referencia (reutilizacion con atribucion)"), "etanol_anp": ("ANP", "ANP Brasil, datos abiertos (Levantamento de Precos de Combustiveis)"),
@@ -382,7 +389,7 @@ def stale_fails(sid, s):
 
 def M(**k): return k
 DEFS = [
- ("sofr_on", M(label="SOFR overnight (NY Fed)", unit="%", dec=2, freq="d", kind="cierre", cal="US", lag=1, tol=1, rng=(0, 10), provider="NY Fed",
+ ("sofr_on", M(label="SOFR diario (NY Fed)", unit="%", dec=2, freq="d", kind="cierre", cal="US", lag=1, tol=1, rng=(0, 10), provider="NY Fed",
                src="NY Fed · Secured Overnight Financing Rate (cierre oficial; NO es Term SOFR)", url="https://www.newyorkfed.org/markets/reference-rates/sofr",
                definition="SOFR overnight, tasa efectiva del dia; publicada ~8:00 ET del siguiente dia habil"), c_nyfed("secured/sofr")),
  ("effr", M(label="Fed funds efectiva (NY Fed)", unit="%", dec=2, freq="d", kind="cierre", cal="US", lag=1, tol=1, frozen_n=9999, rng=(0, 10), provider="NY Fed",
@@ -421,9 +428,12 @@ DEFS = [
  ("acucar_santos_cepea", M(label="Azucar cristal Santos FOB (Cepea/Esalq)", unit="R$/saca 50 kg", dec=2, freq="d", kind="cierre", cal="BR", lag=0, tol=1, rng=(20, 600), provider="CEPEA/ESALQ-USP",
                           src="CEPEA/ESALQ-USP · Indicador del azucar cristal, Santos (FOB) (CC BY-NC 4.0)", url="https://www.cepea.esalq.usp.br/br/indicador/acucar.aspx",
                           definition="Azucar fisico FOB Santos (R$/saca 50 kg); NO es el contrato No. 11 de ICE"), c_cepea("acucar", "CRISTAL - SANTOS", "VALOR R$")),
- ("sofr_avg90", M(label="SOFR promedio 90 dias (NY Fed)", unit="%", dec=3, freq="d", kind="cierre", cal="US", lag=1, tol=1, rng=(0, 10), provider="NY Fed",
+ ("sofr_avg90", M(label="SOFR promedio 90 días (ref. Term 3M)", unit="%", dec=3, freq="d", kind="cierre", cal="US", lag=1, tol=1, rng=(0, 10), provider="NY Fed",
                   src="NY Fed · SOFR Averages (90 dias, hacia atras)", url="https://www.newyorkfed.org/markets/reference-rates/sofr-averages-and-index",
-                  definition="Promedio compuesto de SOFR a 90 dias, hacia atras; NO es CME Term SOFR 3M (prospectivo, con licencia CME)"), c_sofr_avg()),
+                  definition="Promedio compuesto de SOFR a 90 dias, hacia atras; referencia libre para Term SOFR 3M, pero NO es CME Term SOFR 3M (prospectivo, con licencia CME)"), c_sofr_avg(90, "3M")),
+ ("sofr_avg180", M(label="SOFR promedio 180 días (ref. Term 6M)", unit="%", dec=3, freq="d", kind="cierre", cal="US", lag=1, tol=1, rng=(0, 10), provider="NY Fed",
+                   src="NY Fed · SOFR Averages (180 dias, hacia atras)", url="https://www.newyorkfed.org/markets/reference-rates/sofr-averages-and-index",
+                   definition="Promedio compuesto de SOFR a 180 dias, hacia atras; referencia libre para Term SOFR 6M, pero NO es CME Term SOFR 6M (prospectivo, con licencia CME)"), c_sofr_avg(180, "6M")),
  ("etanol_anp", M(label="Etanol hidratado al consumidor (ANP)", unit="R$/l", dec=3, freq="w", kind="semanal", cal="BR", lag=0, tol=9, rng=(1, 15), provider="ANP Brasil",
                   src="ANP · Levantamiento de Precios de Combustibles, producto ETANOL (promedio simple semanal de bombas)", url="https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis",
                   definition="Precio al consumidor (bomba), NO el precio de productor Cepea/Esalq del radar.json"), c_anp),
