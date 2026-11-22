@@ -1,0 +1,55 @@
+﻿name: Update public market data
+
+# Descarga series de mercado con licencia de redistribucion y publica SOLO data/live.json (+ historicos CSV).
+# Modo publico (PUBLIC_MODE=1): excluye FMP, CZ App/ICE y cualquier analisis interno. Cepea (CC BY-NC 4.0) se publica con atribucion; ALLOW_NC=0 lo retira.
+on:
+  schedule:
+    - cron: "0 14 * * 1-5"   # 08:00 Guatemala: NY Fed, EIA, ECB, Banguat y Cepea del dia habil anterior
+    - cron: "30 22 * * 1-5"  # 16:30 Guatemala: BCB (PTAX) y cierres del dia
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-live
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Fetch public series
+        env:
+          PUBLIC_MODE: "1"
+          HISTORY_DIR: data/history
+          ALLOW_NC: "1"
+        run: python tools/update_live.py data/live.json --fail-on-alert || echo "ALERTS=1" >> "$GITHUB_ENV"
+
+      - name: Validate JSON before publishing
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("data/live.json", encoding="utf-8"))
+          assert d.get("publico") is True and d.get("schema") == 2 and len(d["sources"]) >= 10, "live.json invalido"
+          banned = [k for k in d["sources"] if "fmp" in k or "mar27" in k]
+          assert not banned and "cierres" not in d, f"series no publicables: {banned}"
+          print("OK", len(d["sources"]), "series", d["generated"])
+          PY
+
+      - name: Commit only if the data changed
+        run: |
+          git config user.name "market-data-bot"
+          git config user.email "market-data-bot@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || (git commit -m "market data $(date -u +%FT%TZ)" && git push)
+
+      - name: Fail the job if a source is down or frozen (alert)
+        if: env.ALERTS == '1'
+        run: |
+          python -c "import json;[print(a['nivel'],a['id'],a['msg']) for a in json.load(open('data/live.json'))['alertas'] if a['nivel']!='obsoleto']"
+          exit 1
