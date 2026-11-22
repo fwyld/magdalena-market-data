@@ -371,6 +371,7 @@ PUBLISH = {
  "hid_cepea": ("CEPEA/ESALQ-USP", "CC BY-NC 4.0: uso no comercial con atribucion (Fonte: CEPEA/ESALQ-USP)"), "anidro_cepea": ("CEPEA/ESALQ-USP", "CC BY-NC 4.0"), "acucar_sp_cepea": ("CEPEA/ESALQ-USP", "CC BY-NC 4.0"), "acucar_santos_cepea": ("CEPEA/ESALQ-USP", "CC BY-NC 4.0")}
 NC_IDS = {"hid_cepea", "anidro_cepea", "acucar_sp_cepea", "acucar_santos_cepea"}
 PUBLIC = os.environ.get("PUBLIC_MODE") == "1"
+OPTIONAL = {"etanol_anp"}          # fuentes que bloquean las IP de servidores en la nube (gov.br: "Connection reset"): se conserva el ultimo dato y se avisa, sin fallar el job
 def publishable(sid): return sid in PUBLISH and (os.environ.get("ALLOW_NC", "1") != "0" or sid not in NC_IDS)
 
 def M(**k): return k
@@ -528,7 +529,7 @@ def main(out_path, only=None, keep_log=True):
     alertas = []                                                    # alertas: fuentes caidas, datos conservados, congelados y obsoletos
     for sid, err in res["errors"].items():
         k = "conservado" if sid in final and final[sid].get("fallback") else "sin_dato"
-        alertas.append({"id": sid, "nivel": "error" if k == "sin_dato" else "caida", "msg": f"fuente caida ({err}); " + ("se conserva el ultimo dato valido del " + (final[sid].get("ultima_fecha") or final[sid]["pts"][-1][0]) if k == "conservado" else "no hay dato guardado")})
+        alertas.append({"id": sid, "nivel": "aviso" if (sid in OPTIONAL and k == "conservado") else ("error" if k == "sin_dato" else "caida"), "msg": f"fuente caida ({err}); " + ("se conserva el ultimo dato valido del " + (final[sid].get("ultima_fecha") or final[sid]["pts"][-1][0]) if k == "conservado" else "no hay dato guardado")})
     for sid, s in final.items():
         if any("congelado" in w for w in s.get("avisos") or []): alertas.append({"id": sid, "nivel": "congelado", "msg": "posible dato congelado"})
         if s.get("estado") == "obsoleto": alertas.append({"id": sid, "nivel": "obsoleto", "msg": f"excede su frecuencia: esperado {s.get('fecha_esperada')}, ultimo {s['pts'][-1][0]} ({s.get('atraso')} dias habiles)"})
