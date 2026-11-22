@@ -373,6 +373,12 @@ NC_IDS = {"hid_cepea", "anidro_cepea", "acucar_sp_cepea", "acucar_santos_cepea"}
 PUBLIC = os.environ.get("PUBLIC_MODE") == "1"
 OPTIONAL = {"etanol_anp"}          # fuentes que bloquean las IP de servidores en la nube (gov.br: "Connection reset"): se conserva el ultimo dato y se avisa, sin fallar el job
 def publishable(sid): return sid in PUBLISH and (os.environ.get("ALLOW_NC", "1") != "0" or sid not in NC_IDS)
+ALERT_AFTER = {"brent_eia": 7, "wti_eia": 7}    # dias habiles de atraso que se toleran antes de alertar. EIA publica por semana: margen mayor
+def stale_fails(sid, s):
+    """Obsoleto que debe fallar el job (nivel 'estancado'). Diarias: tol + 3 dias habiles; semanales y mensuales: tol. Opcionales y privadas solo avisan."""
+    if sid in OPTIONAL or not publishable(sid): return False
+    tol = s.get("tol", 1)
+    return s.get("atraso", 0) > ALERT_AFTER.get(sid, tol + 3 if s.get("freq") == "d" else tol)
 
 def M(**k): return k
 DEFS = [
@@ -399,10 +405,10 @@ DEFS = [
                definition="Cruce derivado de las referencias del BCE; NO es el cierre de mercado USD/INR del radar.json"), c_ecb_inr),
  ("brent_fmp", M(label="Brent 1er mes (FMP, EOD ICE)", unit="USD/bbl", dec=2, freq="d", kind="cierre", cal="UK", lag=0, tol=1, rng=(10, 250), kpi="brent", provider="FMP",
                  src="FMP · BZUSD, cierre EOD del contrato ICE Brent de 1er mes (misma fuente y serie que el indicador Brent de la edicion)", url="https://site.financialmodelingprep.com/developer/docs/stable/commodities-historical-price-eod-light",
-                 definition="Brent ICE 1er mes, cierre diario. Verificado: el cierre FMP del 11 nov (92.76) es identico al KPI brent del radar.json"), c_fmp("BZUSD")),
+                 definition="Brent ICE 1er mes, cierre diario. Verificado: el cierre FMP del 11 nov es identico al KPI brent del radar.json"), c_fmp("BZUSD")),
  ("inr_fmp", M(label="USD/INR (FMP, EOD)", unit="INR por USD", dec=3, freq="d", kind="cierre", cal="US", lag=0, tol=1, rng=(40, 150), kpi="inr", provider="FMP",
                src="FMP · USDINR, cierre EOD (misma fuente y serie que el indicador USD/INR de la edicion)", url="https://site.financialmodelingprep.com/developer/docs/stable/forex-historical-price-eod-light",
-               definition="USD/INR spot, cierre diario. Verificado: el cierre FMP del 11 nov (93.68) es identico al KPI inr del radar.json"), c_fmp("USDINR")),
+               definition="USD/INR spot, cierre diario. Verificado: el cierre FMP del 11 nov es identico al KPI inr del radar.json"), c_fmp("USDINR")),
  ("hid_cepea", M(label="Etanol hidratado combustible (Cepea/Esalq SP)", unit="R$/l", dec=4, freq="w", kind="semanal", cal="BR", lag=0, tol=9, rng=(0.5, 15), kpi="hid", provider="CEPEA/ESALQ-USP",
                  src="CEPEA/ESALQ-USP · Indicador semanal del etanol hidratado combustible, Sao Paulo (CC BY-NC 4.0)", url="https://www.cepea.esalq.usp.br/br/indicador/etanol.aspx",
                  definition="MISMA serie que el KPI hid del radar.json (2.8799 R$/l, semana 2-6 nov 2026: verificado). Sin flete ni ICMS; PIS/Cofins zerado"), c_cepea("etanol", "HIDRATADO COMBUSTIVEL", "R$/LITRO")),
@@ -532,7 +538,9 @@ def main(out_path, only=None, keep_log=True):
         alertas.append({"id": sid, "nivel": "aviso" if (sid in OPTIONAL and k == "conservado") else ("error" if k == "sin_dato" else "caida"), "msg": f"fuente caida ({err}); " + ("se conserva el ultimo dato valido del " + (final[sid].get("ultima_fecha") or final[sid]["pts"][-1][0]) if k == "conservado" else "no hay dato guardado")})
     for sid, s in final.items():
         if any("congelado" in w for w in s.get("avisos") or []): alertas.append({"id": sid, "nivel": "congelado", "msg": "posible dato congelado"})
-        if s.get("estado") == "obsoleto": alertas.append({"id": sid, "nivel": "obsoleto", "msg": f"excede su frecuencia: esperado {s.get('fecha_esperada')}, ultimo {s['pts'][-1][0]} ({s.get('atraso')} dias habiles)"})
+        if s.get("estado") == "obsoleto":
+            alertas.append({"id": sid, "nivel": "estancado" if stale_fails(sid, s) else "obsoleto",
+                            "msg": f"excede su frecuencia: esperado {s.get('fecha_esperada')}, ultimo {s['pts'][-1][0]} ({s.get('atraso')} {'dias habiles' if s.get('freq') == 'd' else 'dias'})"})
     res["alertas"] = alertas
     res["log"] = LOG if keep_log else []
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -552,8 +560,8 @@ def main(out_path, only=None, keep_log=True):
     return 0 if final else 1
 
 def alert_code(path):
-    """codigo 3 si hay fuentes caidas/congeladas (para que GitHub Actions avise por correo); las obsoletas son informativas."""
-    return 3 if any(a["nivel"] in ("error", "caida", "congelado") for a in json.load(open(path, encoding="utf-8")).get("alertas", [])) else 0
+    """codigo 3 si hay fuentes caidas, congeladas o estancadas (GitHub Actions avisa por correo); 'obsoleto' (atraso corto, opcional o privada) es informativo."""
+    return 3 if any(a["nivel"] in ("error", "caida", "congelado", "estancado") for a in json.load(open(path, encoding="utf-8")).get("alertas", [])) else 0
 
 if __name__ == "__main__":
     a = [x for x in sys.argv[1:] if not x.startswith("--")]
