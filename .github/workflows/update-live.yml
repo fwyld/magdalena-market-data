@@ -4,6 +4,7 @@
 # Modo publico (PUBLIC_MODE=1): excluye FMP, CZ App/ICE y cualquier analisis interno. Cepea (CC BY-NC 4.0) se publica con atribucion; ALLOW_NC=0 lo retira.
 on:
   schedule:
+    - cron: "17 11 * * 1-5"  # 05:17 Guatemala: corrida matutina
     - cron: "0 14 * * 1-5"   # 08:00 Guatemala: NY Fed, EIA, ECB, Banguat y Cepea del dia habil anterior
     - cron: "30 22 * * 1-5"  # 16:30 Guatemala: BCB (PTAX) y cierres del dia
   workflow_dispatch:
@@ -19,8 +20,10 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # ref: main -> un re-run toma la punta actual de main, no el commit viejo del run original
+      - uses: actions/checkout@v7
+        with: { ref: main }
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
 
       - name: Fetch public series
@@ -28,7 +31,7 @@ jobs:
           PUBLIC_MODE: "1"
           HISTORY_DIR: data/history
           ALLOW_NC: "1"
-        run: python tools/update_live.py data/live.json --fail-on-alert || echo "ALERTS=1" >> "$GITHUB_ENV"
+        run: python tools/update_live.py data/live.json
 
       - name: Validate JSON before publishing
         run: |
@@ -46,10 +49,15 @@ jobs:
           git config user.name "market-data-bot"
           git config user.email "market-data-bot@users.noreply.github.com"
           git add data
-          git diff --cached --quiet || (git commit -m "market data $(date -u +%FT%TZ)" && git push)
-
-      - name: Fail the job if a source is down or frozen (alert)
-        if: env.ALERTS == '1'
-        run: |
-          python -c "import json;[print(a['nivel'],a['id'],a['msg']) for a in json.load(open('data/live.json'))['alertas'] if a['nivel']!='obsoleto']"
+          if git diff --cached --quiet; then echo "sin cambios"; exit 0; fi
+          git commit -m "market data $(date -u +%FT%TZ)"
+          for i in 1 2 3; do
+            # -X theirs: en un conflicto prevalece nuestro commit (live.json se regenera completo en cada corrida)
+            git pull --rebase -X theirs origin main && git push origin HEAD:main && exit 0
+            git rebase --abort 2>/dev/null || true
+            echo "push rechazado (intento $i); reintento"; sleep $((i * 5))
+          done
           exit 1
+
+      - name: Report source alerts (warnings; fail only if most sources are down)
+        run: python tools/check_alerts.py data/live.json

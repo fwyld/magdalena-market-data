@@ -154,10 +154,25 @@ def c_ecb_inr():
     return {"pts": [(d, round(inr[d] / usd[d], 4)) for d in sorted(inr) if d in usd],
             "extra": {"derivado": "EUR/INR dividido entre EUR/USD (referencia BCE ~14:15 CET); no es un cierre de mercado"}}
 
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,*/*;q=0.8", "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7"}
+ANP_BACKOFF = (5, 15, 40)                                      # segundos entre reintentos (gov.br resetea conexiones de IP de nube de forma intermitente)
+
 def _anp_stream(url, acc):
+    """Descarga un CSV de ANP con reintentos y espera creciente; headers de navegador. Las filas se indexan por (CNPJ, fecha), asi que reintentar es idempotente."""
+    last = None
+    for i in range(len(ANP_BACKOFF) + 1):
+        try: return _anp_stream_once(url, acc)
+        except Exception as e:
+            last = e
+            LOG.append({"id": "anp", "url": url.split("?")[0].split("/")[-1], "ok": False, "intento": i + 1, "err": str(e)[:100]})
+            if i < len(ANP_BACKOFF): time.sleep(ANP_BACKOFF[i])
+    raise last
+
+def _anp_stream_once(url, acc):
     """Lee un CSV de ANP en streaming (los archivos mensuales pesan decenas de MB) y acumula precio de ETANOL por semana."""
     t0 = time.time()
-    req = urllib.request.Request(url, headers=UA)
+    req = urllib.request.Request(url, headers=BROWSER_UA)
     n = 0
     with urllib.request.urlopen(req, timeout=180) as r:
         rd = csv.reader(io.TextIOWrapper(r, encoding="utf-8-sig", errors="replace", newline=""), delimiter=";")
@@ -180,7 +195,13 @@ def _anp_stream(url, acc):
 def c_anp():
     """Etanol hidratado al consumidor: promedio simple por semana (domingo-sabado) del Levantamiento de Precios de ANP (CSV abierto).
     Fuentes: archivo 'ultimas 4 semanas' + los archivos mensuales mas recientes listados en la pagina de dados abertos."""
-    page = http("https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis", sid="anp_page", timeout=90).decode("utf-8", "replace")
+    page = None
+    for i in range(len(ANP_BACKOFF) + 1):
+        try:
+            page = http("https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis", sid="anp_page", timeout=90, retries=0, headers=BROWSER_UA).decode("utf-8", "replace"); break
+        except Exception:
+            if i == len(ANP_BACKOFF): raise
+            time.sleep(ANP_BACKOFF[i])
     root = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/"
     monthly = sorted({m for m in re.findall(r'href="(https://www\.gov\.br/anp/[^"]*/shpc/dsan/%d/[^"]*gasolina-etanol\.csv)"' % TODAY_GT.year, page)},
                      key=lambda u: int(re.search(r"/(\d{2})-", u).group(1)) if re.search(r"/(\d{2})-", u) else 0)
@@ -476,6 +497,28 @@ def status_of(meta, pts):
     stale = late > meta["tol"]
     return {"estado": "obsoleto" if stale else "ultimo_cierre", "fecha_esperada": exp.isoformat(), "atraso": late}
 
+def ethanol_reference(final):
+    """Referencia de etanol hidratado de Brasil con la fuente usada y la fecha del dato.
+    ANP (precio al consumidor) si esta vigente y se descargo en esta corrida; si no, Cepea/Esalq (precio de productor SP, otro concepto de precio) como respaldo.
+    Cada serie conserva su propio historial: el respaldo NO se mezcla en etanol_anp; solo se etiqueta cual se uso."""
+    def pick(sid):
+        s = final.get(sid)
+        return s if s and s.get("pts") else None
+    anp, cep = pick("etanol_anp"), pick("hid_cepea")
+    anp_ok = anp and not anp.get("fallback") and anp.get("estado") != "obsoleto"
+    used, why = (anp, None) if anp_ok else (cep, None)
+    if not anp_ok:
+        why = ("ANP sin datos nuevos en esta corrida (" + str(anp.get("error_ultima_corrida", "dato obsoleto"))[:100] + ")") if anp else "ANP sin datos guardados"
+        if not cep: used = anp                                         # sin respaldo disponible: se informa lo ultimo de ANP, marcado como no vigente
+    if not used: return None
+    sid = used["id"]
+    out = {"fuente_usada": "anp" if sid == "etanol_anp" else "cepea", "serie_id": sid, "proveedor": used.get("provider"), "etiqueta": used.get("label"),
+           "fecha_dato": used["pts"][-1][0], "valor": used["pts"][-1][1], "unidad": used.get("unit"), "estado": used.get("estado"),
+           "tipo_precio": "consumidor (bomba)" if sid == "etanol_anp" else "productor Sao Paulo (sin flete ni ICMS)", "generado": NOW.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if why: out["motivo_respaldo"] = why
+    if anp: out["anp_ultima_fecha"] = anp["pts"][-1][0]
+    return out
+
 def main(out_path, only=None, keep_log=True):
     prev = {}
     if os.path.exists(out_path):
@@ -542,7 +585,9 @@ def main(out_path, only=None, keep_log=True):
         res["publico"] = True; res["aviso"] = "Datos de mercado publicos con atribucion. No incluye analisis interno ni datos de proveedores sin permiso de redistribucion."
         res["licencias"] = {k: {"proveedor": PUBLISH[k][0], "licencia": PUBLISH[k][1]} for k in final}
     res["sources"] = final
-    alertas = []                                                    # alertas: fuentes caidas, datos conservados, congelados y obsoletos
+    eth = ethanol_reference(final)                                     # etanol hidratado de Brasil: ANP si esta vigente; si no, Cepea/Esalq (sin mezclar las series)
+    if eth: res["etanol_hidratado_br"] = eth
+    alertas = []                                                  # alertas: fuentes caidas, datos conservados, congelados y obsoletos
     for sid, err in res["errors"].items():
         k = "conservado" if sid in final and final[sid].get("fallback") else "sin_dato"
         alertas.append({"id": sid, "nivel": "aviso" if (sid in OPTIONAL and k == "conservado") else ("error" if k == "sin_dato" else "caida"), "msg": f"fuente caida ({err}); " + ("se conserva el ultimo dato valido del " + (final[sid].get("ultima_fecha") or final[sid]["pts"][-1][0]) if k == "conservado" else "no hay dato guardado")})
